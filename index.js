@@ -362,6 +362,29 @@ io.on('connection', (socket) => {
       });
 
       callback({ success: true, gender: result.gender });
+
+      // Auto-advance to next player if current player has no more keys
+      const currentPlayer = room.players[room.currentPlayerIndex];
+      if (currentPlayer.keys === 0) {
+        setTimeout(() => {
+          const nextResult = room.nextPlayerTurn();
+
+          if (nextResult.gameFinished) {
+            const winner = room.calculateWinner();
+            io.to(pin).emit('game-finished', {
+              gameState: room.gameState,
+              winner,
+              players: room.players,
+              babyGender: room.config.babyGender
+            });
+          } else {
+            io.to(pin).emit('player-turn-changed', {
+              currentPlayerIndex: room.currentPlayerIndex,
+              players: room.players
+            });
+          }
+        }, 2000); // Wait 2 seconds for animation
+      }
     } catch (error) {
       callback({ success: false, error: error.message });
     }

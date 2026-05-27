@@ -140,8 +140,9 @@ io.on('connection', (socket) => {
         return callback({ success: false, error: 'Only admin can start game' });
       }
 
-      if (!room.areAllPlayersReady()) {
-        return callback({ success: false, error: 'Not all players are ready' });
+      // Check if there are any players
+      if (room.players.length === 0) {
+        return callback({ success: false, error: 'No players in room' });
       }
 
       room.startQuiz();

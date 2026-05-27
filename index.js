@@ -8,15 +8,25 @@ const app = express();
 const server = http.createServer(app);
 
 // Configure CORS for Socket.io
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://10.0.0.6:3000",
+  "https://gender-reveal-app-livid.vercel.app",
+  process.env.CLIENT_URL
+].filter(Boolean);
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
     credentials: true
   }
 });
 
-app.use(cors());
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true
+}));
 app.use(express.json());
 
 // Store active game rooms

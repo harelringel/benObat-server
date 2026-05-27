@@ -9,9 +9,10 @@ class GameRoom {
     // Quiz state
     this.currentQuestionIndex = 0;
     this.currentPlayerIndex = 0;
-    this.quizPhase = 'waiting'; // 'waiting', 'answering', 'open_for_all', 'result'
+    this.quizPhase = 'answering'; // 'answering', 'open_for_all', 'result'
     this.currentAnswerer = null;
-    this.timeLeft = config.timerSeconds || 40;
+    this.timeLeft = 30; // Always 30 seconds per player
+    this.openForAllTimeLeft = 10; // 10 seconds for open-for-all
 
     // Board state
     this.boardLayout = this.generateBoardLayout();
@@ -82,8 +83,9 @@ class GameRoom {
     this.gameState = 'QUIZ_QUESTION';
     this.currentQuestionIndex = 0;
     this.currentPlayerIndex = 0;
-    this.quizPhase = 'waiting';
-    this.timeLeft = this.config.timerSeconds;
+    this.quizPhase = 'answering'; // Start immediately with timer
+    this.timeLeft = 30; // 30 seconds for current player
+    this.currentAnswerer = this.players[0]?.id; // Set first player as answerer
   }
 
   getCurrentQuestion() {
@@ -91,24 +93,10 @@ class GameRoom {
   }
 
   buzzIn(playerId) {
-    // Check if it's this player's turn or if question is open for all
-    const currentPlayer = this.players[this.currentPlayerIndex];
-
-    if (this.quizPhase === 'waiting' && currentPlayer.id === playerId) {
-      // It's their turn
-      this.quizPhase = 'answering';
-      this.currentAnswerer = playerId;
-      return {
-        success: true,
-        playerName: currentPlayer.name
-      };
-    }
-
-    if (this.quizPhase === 'open_for_all') {
-      // First to buzz in gets to answer
+    // Only allow buzz-in during open_for_all phase
+    if (this.quizPhase === 'open_for_all' && !this.currentAnswerer) {
       const player = this.players.find(p => p.id === playerId);
       if (player) {
-        this.quizPhase = 'answering';
         this.currentAnswerer = playerId;
         return {
           success: true,
@@ -119,7 +107,7 @@ class GameRoom {
 
     return {
       success: false,
-      error: 'Not your turn or question not open'
+      error: 'Question not open for buzz-in'
     };
   }
 
@@ -157,13 +145,27 @@ class GameRoom {
       return { quizFinished: true };
     }
 
-    // Next question
+    // Next question - start immediately with timer
     this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
-    this.quizPhase = 'waiting';
-    this.currentAnswerer = null;
-    this.timeLeft = this.config.timerSeconds;
+    this.quizPhase = 'answering';
+    this.currentAnswerer = this.players[this.currentPlayerIndex]?.id;
+    this.timeLeft = 30; // 30 seconds per player
 
     return { quizFinished: false };
+  }
+
+  // Handle timer expiration - open question to everyone
+  timerExpired() {
+    if (this.quizPhase === 'answering') {
+      this.quizPhase = 'open_for_all';
+      this.currentAnswerer = null;
+      this.timeLeft = 10; // 10 seconds for everyone
+      return { openedToAll: true };
+    } else if (this.quizPhase === 'open_for_all') {
+      // No one answered, move to next question
+      return { skipQuestion: true };
+    }
+    return { openedToAll: false, skipQuestion: false };
   }
 
   openCircle(playerId, circleIndex) {

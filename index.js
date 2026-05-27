@@ -29,8 +29,9 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Store active game rooms
+// Store active game rooms and their timers
 const rooms = new Map();
+const roomTimers = new Map();
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -40,6 +41,74 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// Timer management for quiz rooms
+function startRoomTimer(pin, room) {
+  // Clear existing timer if any
+  if (roomTimers.has(pin)) {
+    clearInterval(roomTimers.get(pin));
+  }
+
+  const timer = setInterval(() => {
+    if (!rooms.has(pin)) {
+      clearInterval(timer);
+      roomTimers.delete(pin);
+      return;
+    }
+
+    room.timeLeft -= 1;
+
+    // Emit timer update
+    io.to(pin).emit('timer-update', {
+      timeLeft: room.timeLeft,
+      quizPhase: room.quizPhase
+    });
+
+    // Check if timer expired
+    if (room.timeLeft <= 0) {
+      const result = room.timerExpired();
+
+      if (result.openedToAll) {
+        // Opened to all players
+        io.to(pin).emit('opened-to-all', {
+          quizPhase: room.quizPhase,
+          timeLeft: room.timeLeft
+        });
+      } else if (result.skipQuestion) {
+        // No one answered, move to next question
+        const nextResult = room.nextQuestion();
+
+        if (nextResult.quizFinished) {
+          clearInterval(timer);
+          roomTimers.delete(pin);
+          io.to(pin).emit('quiz-finished', {
+            gameState: room.gameState,
+            players: room.players
+          });
+        } else {
+          io.to(pin).emit('next-question', {
+            currentQuestion: room.getCurrentQuestion(),
+            currentPlayerIndex: room.currentPlayerIndex,
+            currentQuestionIndex: room.currentQuestionIndex,
+            currentAnswerer: room.currentAnswerer,
+            players: room.players,
+            quizPhase: room.quizPhase,
+            timeLeft: room.timeLeft
+          });
+        }
+      }
+    }
+  }, 1000);
+
+  roomTimers.set(pin, timer);
+}
+
+function stopRoomTimer(pin) {
+  if (roomTimers.has(pin)) {
+    clearInterval(roomTimers.get(pin));
+    roomTimers.delete(pin);
+  }
+}
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
@@ -147,11 +216,17 @@ io.on('connection', (socket) => {
 
       room.startQuiz();
 
+      // Start timer for this room
+      startRoomTimer(pin, room);
+
       io.to(pin).emit('quiz-started', {
         gameState: room.gameState,
         currentQuestion: room.getCurrentQuestion(),
         currentPlayerIndex: room.currentPlayerIndex,
-        players: room.players
+        currentAnswerer: room.currentAnswerer,
+        players: room.players,
+        quizPhase: room.quizPhase,
+        timeLeft: room.timeLeft
       });
 
       callback({ success: true });
@@ -194,6 +269,9 @@ io.on('connection', (socket) => {
 
       const result = room.submitAnswer(playerId, answerIndex);
 
+      // Stop timer temporarily
+      stopRoomTimer(pin);
+
       io.to(pin).emit('answer-submitted', {
         playerId,
         answerIndex,
@@ -202,6 +280,31 @@ io.on('connection', (socket) => {
         players: room.players,
         phase: room.quizPhase
       });
+
+      // Move to next question after 3 seconds
+      setTimeout(() => {
+        const nextResult = room.nextQuestion();
+
+        if (nextResult.quizFinished) {
+          io.to(pin).emit('quiz-finished', {
+            gameState: room.gameState,
+            players: room.players
+          });
+        } else {
+          io.to(pin).emit('next-question', {
+            currentQuestion: room.getCurrentQuestion(),
+            currentPlayerIndex: room.currentPlayerIndex,
+            currentQuestionIndex: room.currentQuestionIndex,
+            currentAnswerer: room.currentAnswerer,
+            players: room.players,
+            quizPhase: room.quizPhase,
+            timeLeft: room.timeLeft
+          });
+
+          // Restart timer for next question
+          startRoomTimer(pin, room);
+        }
+      }, 3000);
 
       callback({ success: true, isCorrect: result.isCorrect });
     } catch (error) {
@@ -304,6 +407,7 @@ io.on('connection', (socket) => {
       if (room.adminSocketId === socket.id) {
         // Admin disconnected - notify players and close room
         io.to(pin).emit('admin-disconnected');
+        stopRoomTimer(pin);
         rooms.delete(pin);
         console.log(`Room ${pin} closed - admin disconnected`);
       } else {

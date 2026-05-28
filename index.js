@@ -49,7 +49,7 @@ app.get('/health', (req, res) => {
 // TIMER MANAGEMENT
 // =============================================================================
 
-// Issue #1: Quiz timer - polls and handles timeout
+// Round 3 Issue #1: Quiz timer - handles primary/open window timeouts
 function startQuizTimer(pin, room) {
   if (quizTimers.has(pin)) {
     clearInterval(quizTimers.get(pin));
@@ -65,15 +65,28 @@ function startQuizTimer(pin, room) {
     const remainingMs = room.currentQuestionDeadlineMs - Date.now();
 
     // Emit timer update every second
-    io.to(pin).emit('quiz:timer', {
-      remainingMs: Math.max(0, remainingMs)
+    io.to(pin).emit('question:timer', {
+      remainingMs: Math.max(0, remainingMs),
+      phase: room.quizPhase
     });
 
     // Check timeout
     if (remainingMs <= 0) {
-      clearInterval(timer);
-      quizTimers.delete(pin);
-      handleQuestionEnd(pin, room, 'timeout');
+      if (room.quizPhase === 'primary') {
+        // Primary window expired - open to all
+        room.openQuestion();
+        io.to(pin).emit('question:opened', {
+          questionId: room.currentQuestionIndex,
+          phase: 'open',
+          deadlineMs: room.currentQuestionDeadlineMs
+        });
+        // Timer continues for open window
+      } else {
+        // Open window expired - end question unanswered
+        clearInterval(timer);
+        quizTimers.delete(pin);
+        handleQuestionEnd(pin, room, 'timeout_open', null);
+      }
     }
   }, 1000);
 
@@ -87,20 +100,22 @@ function stopQuizTimer(pin) {
   }
 }
 
-// Issue #1: Handle question end → REVIEW
-function handleQuestionEnd(pin, room, reason) {
-  const reviewData = room.endQuestion(reason);
+// Round 3 Issue #1: Handle question end → REVIEW
+function handleQuestionEnd(pin, room, reason, resolvedBy) {
+  const reviewData = room.endQuestion(reason, resolvedBy);
 
   if (reviewData.alreadyAdvanced) {
     return; // Idempotent - already transitioned
   }
 
-  // Broadcast review state
-  io.to(pin).emit('quiz:review', {
-    correctAnswer: reviewData.correctAnswer,
-    results: reviewData.results,
-    reviewDurationMs: reviewData.reviewDurationMs,
-    players: room.getPlayersState()
+  // Broadcast question ended (review state)
+  io.to(pin).emit('question:ended', {
+    questionId: room.currentQuestionIndex,
+    correctOptionId: reviewData.correctAnswer,
+    resolvedBy: reviewData.resolvedBy,
+    perPlayer: reviewData.results,
+    leaderboard: room.getPlayersState(),
+    reviewDurationMs: reviewData.reviewDurationMs
   });
 
   // Auto-advance after review duration
@@ -113,7 +128,19 @@ function handleQuestionEnd(pin, room, reason) {
       startKeyWallTimer(pin, room);
     } else {
       // Next question
-      io.to(pin).emit('quiz:question', room.getCurrentPhaseState());
+      const activePlayerId = room.quizTurnQueue[room.currentQuizTurnIndex];
+      io.to(pin).emit('question:started', {
+        ...room.getCurrentPhaseState(),
+        questionId: room.currentQuestionIndex,
+        index: room.currentQuestionIndex,
+        total: room.config.questions.length,
+        type: 'multiple_choice',
+        prompt: room.getCurrentQuestion().question,
+        options: room.getCurrentQuestion().options,
+        activePlayerId: activePlayerId,
+        phase: room.quizPhase,
+        deadlineMs: room.currentQuestionDeadlineMs
+      });
       startQuizTimer(pin, room);
     }
   }, reviewData.reviewDurationMs);
@@ -158,8 +185,8 @@ function startKeyWallTimer(pin, room) {
       // Advance turn
       room.advanceTurn('timeout');
 
-      // Check if wall ended
-      if (room.gameState === 'RESULTS_COMPARISON') {
+      // Check if wall ended (Round 3 Issue #2: goes to KEY_WALL_DONE)
+      if (room.gameState === 'KEY_WALL_DONE') {
         stopKeyWallTimer(pin);
         handleKeyWallEnd(pin, room);
       }
@@ -176,22 +203,16 @@ function stopKeyWallTimer(pin) {
   }
 }
 
-// Issue #4: Handle key wall end → RESULTS_COMPARISON
+// Round 3 Issue #2: Handle key wall end → KEY_WALL_DONE (waiting for host)
 function handleKeyWallEnd(pin, room) {
-  const comparison = room.getComparisonTable();
-
-  io.to(pin).emit('results:comparison', {
-    ...comparison,
-    comparisonDurationMs: room.config.comparisonDurationSec * 1000
+  // Emit announce:ready - host sees button, guests see holding screen
+  io.to(pin).emit('announce:ready', {
+    scoreBoy: room.keys.filter(k => k.claimed && k.gender === 'boy').length,
+    scoreGirl: room.keys.filter(k => k.claimed && k.gender === 'girl').length
   });
 
-  // Auto-advance to winner after comparison duration
-  setTimeout(() => {
-    room.advanceToWinner();
-    const winners = room.calculateWinners();
-
-    io.to(pin).emit('results:winner', winners);
-  }, room.config.comparisonDurationSec * 1000);
+  console.log(`[room ${pin}] KEY_WALL_DONE - waiting for host to announce results`);
+  // No auto-advance - waits for host to trigger game:announce
 }
 
 // =============================================================================
@@ -428,7 +449,7 @@ io.on('connection', (socket) => {
   // QUIZ PHASE (Issue #1)
   // =========================================================================
 
-  // Submit answer
+  // Submit answer (Round 3 Issue #1: handle primary/open transitions)
   socket.on('quiz:answer', ({ pin, playerId, answerIndex }, callback) => {
     try {
       const room = rooms.get(pin);
@@ -448,10 +469,21 @@ io.on('connection', (socket) => {
         players: room.getPlayersState()
       });
 
+      // Check if should open question to everyone
+      if (result.shouldOpenQuestion) {
+        room.openQuestion();
+        io.to(pin).emit('question:opened', {
+          questionId: room.currentQuestionIndex,
+          phase: 'open',
+          deadlineMs: room.currentQuestionDeadlineMs
+        });
+        // Timer continues for open window
+      }
+
       // Check if should end question
       if (result.shouldEndQuestion) {
         stopQuizTimer(pin);
-        handleQuestionEnd(pin, room, result.reason);
+        handleQuestionEnd(pin, room, result.reason, result.resolvedBy);
       }
 
       callback({ success: true });
@@ -491,8 +523,8 @@ io.on('connection', (socket) => {
       // Advance turn
       room.advanceTurn('claimed');
 
-      // Check if wall ended
-      if (room.gameState === 'RESULTS_COMPARISON') {
+      // Check if wall ended (Round 3 Issue #2: goes to KEY_WALL_DONE)
+      if (room.gameState === 'KEY_WALL_DONE') {
         stopKeyWallTimer(pin);
         handleKeyWallEnd(pin, room);
       } else {
@@ -511,32 +543,76 @@ io.on('connection', (socket) => {
   });
 
   // =========================================================================
-  // RESULTS PHASE (Issue #4)
+  // RESULTS PHASE (Round 3 Issue #2 & #3: Host-gated transitions)
   // =========================================================================
 
-  // Host can manually advance from comparison to winner (optional)
-  socket.on('results:show-winner', ({ pin }, callback) => {
+  // Round 3 Issue #2: Host announces results (KEY_WALL_DONE → RESULTS_COMPARISON)
+  socket.on('game:announce', ({ pin, hostToken }, callback) => {
     try {
       const room = rooms.get(pin);
       if (!room) {
         return callback({ success: false, error: 'Room not found' });
       }
 
-      if (socket.id !== room.adminSocketId) {
-        return callback({ success: false, error: 'Only admin can advance' });
+      // Validate host (can use adminToken or socket ID)
+      if (hostToken !== room.adminToken && socket.id !== room.adminSocketId) {
+        return callback({ success: false, error: 'Only host can announce results' });
+      }
+
+      if (room.gameState !== 'KEY_WALL_DONE') {
+        return callback({ success: false, error: 'Not in waiting state' });
+      }
+
+      // Transition to comparison table
+      room.advanceToComparison();
+      const comparison = room.getComparisonTable();
+
+      io.to(pin).emit('results:comparison', {
+        ...comparison
+      });
+
+      console.log(`[room ${pin}] KEY_WALL_DONE → RESULTS_COMPARISON (host announce)`);
+
+      callback({ success: true });
+    } catch (error) {
+      console.error('Error announcing results:', error);
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // Round 3 Issue #3: Host reveals gender (RESULTS_COMPARISON → RESULTS_REVEAL)
+  socket.on('game:reveal', ({ pin, hostToken }, callback) => {
+    try {
+      const room = rooms.get(pin);
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
+      }
+
+      // Validate host (can use adminToken or socket ID)
+      if (hostToken !== room.adminToken && socket.id !== room.adminSocketId) {
+        return callback({ success: false, error: 'Only host can reveal gender' });
       }
 
       if (room.gameState !== 'RESULTS_COMPARISON') {
         return callback({ success: false, error: 'Not in comparison phase' });
       }
 
-      room.advanceToWinner();
+      // Transition to reveal
+      room.advanceToReveal();
       const winners = room.calculateWinners();
+      const comparison = room.getComparisonTable();
 
-      io.to(pin).emit('results:winner', winners);
+      io.to(pin).emit('results:reveal', {
+        actualGender: room.config.babyGender,
+        winners,
+        rows: comparison.rows
+      });
+
+      console.log(`[room ${pin}] RESULTS_COMPARISON → RESULTS_REVEAL (host reveal)`);
 
       callback({ success: true });
     } catch (error) {
+      console.error('Error revealing gender:', error);
       callback({ success: false, error: error.message });
     }
   });

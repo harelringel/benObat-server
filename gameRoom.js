@@ -13,14 +13,17 @@ class GameRoom {
     this.adminSocketId = null;
     this.players = [];
 
-    // State machine: LOBBY → ASKING → REVIEW → (ASKING ↺ | KEY_WALL) → RESULTS_COMPARISON → RESULTS_WINNER → END
+    // State machine: LOBBY → ASKING → REVIEW → (ASKING ↺ | KEY_WALL) → KEY_WALL_DONE → RESULTS_COMPARISON → RESULTS_REVEAL → END
     this.gameState = 'LOBBY';
 
-    // Quiz state
+    // Quiz state (Round 3: turn-based, two-window model)
     this.currentQuestionIndex = 0;
+    this.quizPhase = null; // 'primary' (20s, active player) or 'open' (10s, all players)
+    this.quizTurnQueue = []; // Rotates through players
+    this.currentQuizTurnIndex = 0;
     this.currentQuestionDeadlineMs = null;
     this.questionAdvanced = false; // Guard against double-advance
-    this.playerAnswers = new Map(); // playerId → answerIndex
+    this.playerAnswers = new Map(); // playerId → answerIndex (for open window)
 
     // Key wall state
     this.keys = this.generateKeys();
@@ -129,67 +132,144 @@ class GameRoom {
            inGamePlayers.every(p => p.ready);
   }
 
-  // Issue #1: Quiz state machine - ASKING phase
+  // Round 3 Issue #1: Quiz state machine - turn-based ASKING phase
   startQuiz() {
     console.log(`[room ${this.pin}] LOBBY → ASKING`);
     this.gameState = 'ASKING';
     this.currentQuestionIndex = 0;
+
+    // Initialize quiz turn queue (rotate through players)
+    this.quizTurnQueue = this.players
+      .filter(p => p.inGame && p.connected)
+      .map(p => p.id);
+    this.currentQuizTurnIndex = 0;
+
     this.startQuestion();
   }
 
   startQuestion() {
     this.questionAdvanced = false;
     this.playerAnswers.clear();
-    this.currentQuestionDeadlineMs = Date.now() + (this.config.timerSeconds * 1000);
-    console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} started`);
+
+    // Check if active player is connected
+    const activePlayerId = this.quizTurnQueue[this.currentQuizTurnIndex];
+    const activePlayer = this.players.find(p => p.id === activePlayerId);
+
+    // If active player disconnected, skip straight to open window
+    if (!activePlayer || !activePlayer.connected) {
+      console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} active player disconnected, skipping to open`);
+      this.openQuestion();
+      return;
+    }
+
+    // Start primary turn window (20 seconds, active player only)
+    this.quizPhase = 'primary';
+    this.currentQuestionDeadlineMs = Date.now() + 20000; // 20 seconds
+    console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} TURN_PRIMARY started (active: ${activePlayer.name})`);
+  }
+
+  // Open question to all players (10 seconds)
+  openQuestion() {
+    if (this.quizPhase === 'open') {
+      console.log(`[room ${this.pin}] Question already open, ignoring`);
+      return;
+    }
+
+    this.quizPhase = 'open';
+    this.currentQuestionDeadlineMs = Date.now() + 10000; // 10 seconds
+    console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} TURN_PRIMARY → TURN_OPEN`);
   }
 
   getCurrentQuestion() {
     return this.config.questions[this.currentQuestionIndex];
   }
 
+  // Round 3 Issue #1: Submit answer with turn validation
   submitAnswer(playerId, answerIndex) {
-    // Record answer regardless of correctness
-    this.playerAnswers.set(playerId, answerIndex);
-
     const question = this.getCurrentQuestion();
     const isCorrect = answerIndex === question.correct;
+    const activePlayerId = this.quizTurnQueue[this.currentQuizTurnIndex];
 
-    if (isCorrect) {
-      const player = this.players.find(p => p.id === playerId);
-      if (player) {
-        player.keysWon += 1;
-        player.quizScore += 1;
+    // PRIMARY PHASE: only active player can answer
+    if (this.quizPhase === 'primary') {
+      if (playerId !== activePlayerId) {
+        throw new Error('Not your turn');
+      }
+
+      console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} active player answered ${isCorrect ? 'correct' : 'wrong'}`);
+
+      if (isCorrect) {
+        // Award key and score
+        const player = this.players.find(p => p.id === playerId);
+        if (player) {
+          player.keysWon += 1;
+          player.quizScore += 1;
+        }
+
+        // Correct answer ends the question
+        return {
+          isCorrect: true,
+          shouldEndQuestion: true,
+          resolvedBy: playerId,
+          reason: 'correct_primary'
+        };
+      } else {
+        // Wrong answer opens to everyone
+        return {
+          isCorrect: false,
+          shouldEndQuestion: false,
+          shouldOpenQuestion: true,
+          reason: 'wrong_primary'
+        };
       }
     }
 
-    console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} player ${playerId} answered ${isCorrect ? 'correct' : 'wrong'}`);
+    // OPEN PHASE: any player can answer (once)
+    if (this.quizPhase === 'open') {
+      // Check if player already answered in this open window
+      if (this.playerAnswers.has(playerId)) {
+        throw new Error('Already answered this question');
+      }
 
-    // Check if all players answered
-    const connectedPlayers = this.players.filter(p => p.connected && p.inGame);
-    if (this.playerAnswers.size >= connectedPlayers.length) {
+      this.playerAnswers.set(playerId, answerIndex);
+      console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} player ${playerId} answered ${isCorrect ? 'correct' : 'wrong'} (open)`);
+
+      if (isCorrect) {
+        // First correct answer in open window wins
+        const player = this.players.find(p => p.id === playerId);
+        if (player) {
+          player.keysWon += 1;
+          player.quizScore += 1;
+        }
+
+        return {
+          isCorrect: true,
+          shouldEndQuestion: true,
+          resolvedBy: playerId,
+          reason: 'correct_open'
+        };
+      }
+
+      // Wrong answer in open window - just record it, keep waiting
       return {
-        isCorrect,
-        shouldEndQuestion: true,
-        reason: 'all_answered'
+        isCorrect: false,
+        shouldEndQuestion: false,
+        reason: 'wrong_open'
       };
     }
 
-    return {
-      isCorrect,
-      shouldEndQuestion: false
-    };
+    throw new Error('Invalid quiz phase');
   }
 
-  // Issue #1: End question and transition to REVIEW
-  endQuestion(reason) {
+  // Round 3 Issue #1: End question and transition to REVIEW
+  endQuestion(reason, resolvedBy = null) {
     if (this.questionAdvanced) {
       console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} already advanced, ignoring`);
       return { alreadyAdvanced: true };
     }
 
     this.questionAdvanced = true;
-    console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} ASKING → REVIEW (reason: ${reason})`);
+    console.log(`[room ${this.pin}] Q${this.currentQuestionIndex + 1} ${this.quizPhase === 'primary' ? 'TURN_PRIMARY' : 'TURN_OPEN'} → REVIEW (reason: ${reason})`);
     this.gameState = 'REVIEW';
 
     const question = this.getCurrentQuestion();
@@ -202,14 +282,18 @@ class GameRoom {
     return {
       alreadyAdvanced: false,
       correctAnswer: question.correct,
+      resolvedBy,
       results,
       reviewDurationMs: this.config.reviewDurationSec * 1000
     };
   }
 
-  // Issue #1: Advance to next question or KEY_WALL
+  // Round 3 Issue #1: Advance to next question or KEY_WALL (rotate turn)
   advanceFromReview() {
     this.currentQuestionIndex += 1;
+
+    // Rotate to next player in quiz turn queue
+    this.currentQuizTurnIndex = (this.currentQuizTurnIndex + 1) % this.quizTurnQueue.length;
 
     if (this.currentQuestionIndex >= this.config.questions.length) {
       // Quiz finished
@@ -333,9 +417,22 @@ class GameRoom {
     return null;
   }
 
+  // Round 3 Issue #2: End key wall → waiting state (host-gated)
   endKeyWall() {
-    console.log(`[room ${this.pin}] KEY_WALL → RESULTS_COMPARISON`);
+    console.log(`[room ${this.pin}] KEY_WALL → KEY_WALL_DONE`);
+    this.gameState = 'KEY_WALL_DONE';
+  }
+
+  // Round 3 Issue #2: Host announces results → comparison table
+  advanceToComparison() {
+    console.log(`[room ${this.pin}] KEY_WALL_DONE → RESULTS_COMPARISON (host announce)`);
     this.gameState = 'RESULTS_COMPARISON';
+  }
+
+  // Round 3 Issue #3: Host reveals gender
+  advanceToReveal() {
+    console.log(`[room ${this.pin}] RESULTS_COMPARISON → RESULTS_REVEAL (host reveal)`);
+    this.gameState = 'RESULTS_REVEAL';
   }
 
   // Issue #4: Results phase
@@ -412,10 +509,13 @@ class GameRoom {
         };
 
       case 'ASKING':
+        const activePlayerId = this.quizTurnQueue[this.currentQuizTurnIndex];
         return {
           ...baseState,
           currentQuestion: this.getCurrentQuestion(),
           currentQuestionIndex: this.currentQuestionIndex,
+          quizPhase: this.quizPhase, // 'primary' or 'open'
+          activePlayerId: activePlayerId,
           remainingTimeMs: Math.max(0, this.currentQuestionDeadlineMs - Date.now()),
           playerAnswers: Array.from(this.playerAnswers.keys())
         };
@@ -443,16 +543,24 @@ class GameRoom {
           scoreGirl: this.keys.filter(k => k.claimed && k.gender === 'girl').length
         };
 
+      case 'KEY_WALL_DONE':
+        return {
+          ...baseState,
+          scoreBoy: this.keys.filter(k => k.claimed && k.gender === 'boy').length,
+          scoreGirl: this.keys.filter(k => k.claimed && k.gender === 'girl').length
+        };
+
       case 'RESULTS_COMPARISON':
         return {
           ...baseState,
           comparison: this.getComparisonTable()
         };
 
-      case 'RESULTS_WINNER':
+      case 'RESULTS_REVEAL':
         return {
           ...baseState,
-          winners: this.calculateWinners()
+          winners: this.calculateWinners(),
+          comparison: this.getComparisonTable()
         };
 
       default:

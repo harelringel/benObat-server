@@ -434,7 +434,20 @@ io.on('connection', (socket) => {
 
       room.startQuiz();
 
-      io.to(pin).emit('quiz:started', room.getCurrentPhaseState());
+      // Emit first question with full details (same as question:started)
+      const activePlayerId = room.quizTurnQueue[room.currentQuizTurnIndex];
+      io.to(pin).emit('question:started', {
+        ...room.getCurrentPhaseState(),
+        questionId: room.currentQuestionIndex,
+        index: room.currentQuestionIndex,
+        total: room.config.questions.length,
+        type: 'multiple_choice',
+        prompt: room.getCurrentQuestion().question,
+        options: room.getCurrentQuestion().options,
+        activePlayerId: activePlayerId,
+        phase: room.quizPhase,
+        deadlineMs: room.currentQuestionDeadlineMs
+      });
 
       // Start quiz timer
       startQuizTimer(pin, room);

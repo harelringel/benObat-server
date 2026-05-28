@@ -31,7 +31,10 @@ app.use(express.json());
 
 // Store active game rooms and their timers
 const rooms = new Map();
-const roomTimers = new Map();
+const quizTimers = new Map();
+const keyWallTimers = new Map();
+const reviewTimers = new Map();
+const comparisonTimers = new Map();
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -42,77 +45,165 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Timer management for quiz rooms
-function startRoomTimer(pin, room) {
-  // Clear existing timer if any
-  if (roomTimers.has(pin)) {
-    clearInterval(roomTimers.get(pin));
+// =============================================================================
+// TIMER MANAGEMENT
+// =============================================================================
+
+// Issue #1: Quiz timer - polls and handles timeout
+function startQuizTimer(pin, room) {
+  if (quizTimers.has(pin)) {
+    clearInterval(quizTimers.get(pin));
   }
 
   const timer = setInterval(() => {
-    if (!rooms.has(pin)) {
+    if (!rooms.has(pin) || room.gameState !== 'ASKING') {
       clearInterval(timer);
-      roomTimers.delete(pin);
+      quizTimers.delete(pin);
       return;
     }
 
-    room.timeLeft -= 1;
+    const remainingMs = room.currentQuestionDeadlineMs - Date.now();
 
-    // Emit timer update
-    io.to(pin).emit('timer-update', {
-      timeLeft: room.timeLeft,
-      quizPhase: room.quizPhase
+    // Emit timer update every second
+    io.to(pin).emit('quiz:timer', {
+      remainingMs: Math.max(0, remainingMs)
     });
 
-    // Check if timer expired
-    if (room.timeLeft <= 0) {
-      const result = room.timerExpired();
+    // Check timeout
+    if (remainingMs <= 0) {
+      clearInterval(timer);
+      quizTimers.delete(pin);
+      handleQuestionEnd(pin, room, 'timeout');
+    }
+  }, 1000);
 
-      if (result.openedToAll) {
-        // Opened to all players
-        io.to(pin).emit('opened-to-all', {
-          quizPhase: room.quizPhase,
-          timeLeft: room.timeLeft
+  quizTimers.set(pin, timer);
+}
+
+function stopQuizTimer(pin) {
+  if (quizTimers.has(pin)) {
+    clearInterval(quizTimers.get(pin));
+    quizTimers.delete(pin);
+  }
+}
+
+// Issue #1: Handle question end → REVIEW
+function handleQuestionEnd(pin, room, reason) {
+  const reviewData = room.endQuestion(reason);
+
+  if (reviewData.alreadyAdvanced) {
+    return; // Idempotent - already transitioned
+  }
+
+  // Broadcast review state
+  io.to(pin).emit('quiz:review', {
+    correctAnswer: reviewData.correctAnswer,
+    results: reviewData.results,
+    reviewDurationMs: reviewData.reviewDurationMs,
+    players: room.getPlayersState()
+  });
+
+  // Auto-advance after review duration
+  setTimeout(() => {
+    const advanceResult = room.advanceFromReview();
+
+    if (advanceResult.quizFinished) {
+      // Move to KEY_WALL
+      io.to(pin).emit('keywall:started', room.getCurrentPhaseState());
+      startKeyWallTimer(pin, room);
+    } else {
+      // Next question
+      io.to(pin).emit('quiz:question', room.getCurrentPhaseState());
+      startQuizTimer(pin, room);
+    }
+  }, reviewData.reviewDurationMs);
+}
+
+// Issue #3: Key wall turn timer
+function startKeyWallTimer(pin, room) {
+  if (keyWallTimers.has(pin)) {
+    clearInterval(keyWallTimers.get(pin));
+  }
+
+  const timer = setInterval(() => {
+    if (!rooms.has(pin) || room.gameState !== 'KEY_WALL') {
+      clearInterval(timer);
+      keyWallTimers.delete(pin);
+      return;
+    }
+
+    const remainingMs = room.currentTurnDeadlineMs - Date.now();
+
+    // Emit timer update
+    io.to(pin).emit('keywall:timer', {
+      remainingMs: Math.max(0, remainingMs),
+      currentTurnPlayerId: room.turnQueue[room.currentTurnPlayerIndex]
+    });
+
+    // Check timeout
+    if (remainingMs <= 0) {
+      // Auto-pick for this player
+      const key = room.autoPickKey();
+
+      if (key) {
+        io.to(pin).emit('keywall:claimed', {
+          keyId: key.id,
+          gender: key.gender,
+          playerId: room.turnQueue[room.currentTurnPlayerIndex],
+          auto: true,
+          ...room.getCurrentPhaseState()
         });
-      } else if (result.skipQuestion) {
-        // No one answered, move to next question
-        const nextResult = room.nextQuestion();
+      }
 
-        if (nextResult.quizFinished) {
-          clearInterval(timer);
-          roomTimers.delete(pin);
-          io.to(pin).emit('quiz-finished', {
-            gameState: room.gameState,
-            players: room.players
-          });
-        } else {
-          io.to(pin).emit('next-question', {
-            currentQuestion: room.getCurrentQuestion(),
-            currentPlayerIndex: room.currentPlayerIndex,
-            currentQuestionIndex: room.currentQuestionIndex,
-            currentAnswerer: room.currentAnswerer,
-            players: room.players,
-            quizPhase: room.quizPhase,
-            timeLeft: room.timeLeft
-          });
-        }
+      // Advance turn
+      room.advanceTurn('timeout');
+
+      // Check if wall ended
+      if (room.gameState === 'RESULTS_COMPARISON') {
+        stopKeyWallTimer(pin);
+        handleKeyWallEnd(pin, room);
       }
     }
   }, 1000);
 
-  roomTimers.set(pin, timer);
+  keyWallTimers.set(pin, timer);
 }
 
-function stopRoomTimer(pin) {
-  if (roomTimers.has(pin)) {
-    clearInterval(roomTimers.get(pin));
-    roomTimers.delete(pin);
+function stopKeyWallTimer(pin) {
+  if (keyWallTimers.has(pin)) {
+    clearInterval(keyWallTimers.get(pin));
+    keyWallTimers.delete(pin);
   }
 }
 
-// Socket.io connection handler
+// Issue #4: Handle key wall end → RESULTS_COMPARISON
+function handleKeyWallEnd(pin, room) {
+  const comparison = room.getComparisonTable();
+
+  io.to(pin).emit('results:comparison', {
+    ...comparison,
+    comparisonDurationMs: room.config.comparisonDurationSec * 1000
+  });
+
+  // Auto-advance to winner after comparison duration
+  setTimeout(() => {
+    room.advanceToWinner();
+    const winners = room.calculateWinners();
+
+    io.to(pin).emit('results:winner', winners);
+  }, room.config.comparisonDurationSec * 1000);
+}
+
+// =============================================================================
+// SOCKET.IO CONNECTION HANDLER
+// =============================================================================
+
 io.on('connection', (socket) => {
   console.log(`Client connected: ${socket.id}`);
+
+  // =========================================================================
+  // ROOM CREATION & JOINING
+  // =========================================================================
 
   // Create new game room (Admin only)
   socket.on('create-room', (gameConfig, callback) => {
@@ -149,25 +240,26 @@ io.on('connection', (socket) => {
         return callback({ success: false, error: 'Game already started' });
       }
 
-      if (room.players.length >= room.config.numPlayers) {
+      if (room.players.filter(p => p.inGame).length >= room.config.numPlayers) {
         return callback({ success: false, error: 'Room is full' });
       }
 
-      const player = room.addPlayer(socket.id, playerName);
+      const playerData = room.addPlayer(socket.id, playerName);
       socket.join(pin);
 
       console.log(`Player ${playerName} joined room ${pin}`);
 
       // Notify all players in room
       io.to(pin).emit('player-joined', {
-        player,
-        players: room.players,
+        player: playerData,
+        players: room.getPlayersState(),
         room: room.getState()
       });
 
       callback({
         success: true,
-        player,
+        playerToken: playerData.playerToken, // Send token for reconnection
+        player: playerData,
         room: room.getState()
       });
     } catch (error) {
@@ -175,6 +267,76 @@ io.on('connection', (socket) => {
       callback({ success: false, error: error.message });
     }
   });
+
+  // Issue #2: Rejoin with playerToken
+  socket.on('room:rejoin', ({ pin, playerToken }, callback) => {
+    try {
+      const room = rooms.get(pin);
+
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
+      }
+
+      const player = room.reconnectPlayer(playerToken, socket.id);
+
+      if (!player) {
+        return callback({ success: false, error: 'Player not found or already left' });
+      }
+
+      socket.join(pin);
+
+      console.log(`Player ${player.name} rejoined room ${pin}`);
+
+      // Notify all players
+      io.to(pin).emit('player-reconnected', {
+        playerId: player.id,
+        playerName: player.name,
+        players: room.getPlayersState()
+      });
+
+      // Send current phase state to rejoining player
+      callback({
+        success: true,
+        player: { ...player, socketId: undefined },
+        currentState: room.getCurrentPhaseState()
+      });
+    } catch (error) {
+      console.error('Error rejoining room:', error);
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // Issue #2: Explicit leave game
+  socket.on('room:leave', ({ pin, playerToken }, callback) => {
+    try {
+      const room = rooms.get(pin);
+
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
+      }
+
+      const player = room.leaveGame(playerToken);
+
+      if (player) {
+        io.to(pin).emit('player-left', {
+          playerId: player.id,
+          playerName: player.name,
+          players: room.getPlayersState()
+        });
+
+        console.log(`Player ${player.name} explicitly left room ${pin}`);
+      }
+
+      callback({ success: true });
+    } catch (error) {
+      console.error('Error leaving room:', error);
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // =========================================================================
+  // LOBBY PHASE
+  // =========================================================================
 
   // Player ready toggle
   socket.on('player-ready', ({ pin, playerId }, callback) => {
@@ -187,7 +349,7 @@ io.on('connection', (socket) => {
       room.togglePlayerReady(playerId);
 
       io.to(pin).emit('player-ready-changed', {
-        players: room.players,
+        players: room.getPlayersState(),
         allReady: room.areAllPlayersReady()
       });
 
@@ -209,25 +371,22 @@ io.on('connection', (socket) => {
         return callback({ success: false, error: 'Only admin can start game' });
       }
 
-      // Check if there are any players
-      if (room.players.length === 0) {
+      const inGamePlayers = room.players.filter(p => p.inGame);
+      if (inGamePlayers.length === 0) {
         return callback({ success: false, error: 'No players in room' });
+      }
+
+      // Require at least 2 players for multiplayer game
+      if (inGamePlayers.length < 2) {
+        return callback({ success: false, error: 'Need at least 2 players to start' });
       }
 
       room.startQuiz();
 
-      // Start timer for this room
-      startRoomTimer(pin, room);
+      io.to(pin).emit('quiz:started', room.getCurrentPhaseState());
 
-      io.to(pin).emit('quiz-started', {
-        gameState: room.gameState,
-        currentQuestion: room.getCurrentQuestion(),
-        currentPlayerIndex: room.currentPlayerIndex,
-        currentAnswerer: room.currentAnswerer,
-        players: room.players,
-        quizPhase: room.quizPhase,
-        timeLeft: room.timeLeft
-      });
+      // Start quiz timer
+      startQuizTimer(pin, room);
 
       callback({ success: true });
     } catch (error) {
@@ -235,185 +394,116 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Player buzzes in to answer
-  socket.on('buzz-in', ({ pin, playerId }, callback) => {
-    try {
-      const room = rooms.get(pin);
-      if (!room) {
-        return callback({ success: false, error: 'Room not found' });
-      }
-
-      const result = room.buzzIn(playerId);
-
-      if (result.success) {
-        io.to(pin).emit('player-buzzed', {
-          playerId,
-          playerName: result.playerName,
-          phase: room.quizPhase
-        });
-      }
-
-      callback(result);
-    } catch (error) {
-      callback({ success: false, error: error.message });
-    }
-  });
+  // =========================================================================
+  // QUIZ PHASE (Issue #1)
+  // =========================================================================
 
   // Submit answer
-  socket.on('submit-answer', ({ pin, playerId, answerIndex }, callback) => {
+  socket.on('quiz:answer', ({ pin, playerId, answerIndex }, callback) => {
     try {
       const room = rooms.get(pin);
       if (!room) {
         return callback({ success: false, error: 'Room not found' });
+      }
+
+      if (room.gameState !== 'ASKING') {
+        return callback({ success: false, error: 'Not in asking phase' });
       }
 
       const result = room.submitAnswer(playerId, answerIndex);
 
-      // Stop timer temporarily
-      stopRoomTimer(pin);
-
-      io.to(pin).emit('answer-submitted', {
+      // Broadcast that player answered (don't reveal correct/wrong yet)
+      io.to(pin).emit('quiz:answered', {
         playerId,
-        answerIndex,
-        isCorrect: result.isCorrect,
-        correctAnswer: result.correctAnswer,
-        players: room.players,
-        phase: room.quizPhase
+        players: room.getPlayersState()
       });
 
-      // Move to next question after 3 seconds
-      setTimeout(() => {
-        const nextResult = room.nextQuestion();
-
-        if (nextResult.quizFinished) {
-          io.to(pin).emit('quiz-finished', {
-            gameState: room.gameState,
-            players: room.players
-          });
-        } else {
-          io.to(pin).emit('next-question', {
-            currentQuestion: room.getCurrentQuestion(),
-            currentPlayerIndex: room.currentPlayerIndex,
-            currentQuestionIndex: room.currentQuestionIndex,
-            currentAnswerer: room.currentAnswerer,
-            players: room.players,
-            quizPhase: room.quizPhase,
-            timeLeft: room.timeLeft
-          });
-
-          // Restart timer for next question
-          startRoomTimer(pin, room);
-        }
-      }, 3000);
-
-      callback({ success: true, isCorrect: result.isCorrect });
-    } catch (error) {
-      callback({ success: false, error: error.message });
-    }
-  });
-
-  // Next question
-  socket.on('next-question', ({ pin }, callback) => {
-    try {
-      const room = rooms.get(pin);
-      if (!room) {
-        return callback({ success: false, error: 'Room not found' });
-      }
-
-      const result = room.nextQuestion();
-
-      if (result.quizFinished) {
-        io.to(pin).emit('quiz-finished', {
-          gameState: room.gameState,
-          players: room.players
-        });
-      } else {
-        io.to(pin).emit('next-question', {
-          currentQuestion: room.getCurrentQuestion(),
-          currentPlayerIndex: room.currentPlayerIndex,
-          currentQuestionIndex: room.currentQuestionIndex,
-          players: room.players
-        });
+      // Check if should end question
+      if (result.shouldEndQuestion) {
+        stopQuizTimer(pin);
+        handleQuestionEnd(pin, room, result.reason);
       }
 
       callback({ success: true });
     } catch (error) {
+      console.error('Error submitting answer:', error);
       callback({ success: false, error: error.message });
     }
   });
 
-  // Open circle on board
-  socket.on('open-circle', ({ pin, playerId, circleIndex }, callback) => {
+  // =========================================================================
+  // KEY WALL PHASE (Issue #3)
+  // =========================================================================
+
+  // Claim key
+  socket.on('keywall:claim', ({ pin, playerId, keyId }, callback) => {
     try {
       const room = rooms.get(pin);
       if (!room) {
         return callback({ success: false, error: 'Room not found' });
       }
 
-      const result = room.openCircle(playerId, circleIndex);
+      if (room.gameState !== 'KEY_WALL') {
+        return callback({ success: false, error: 'Not in key wall phase' });
+      }
 
-      io.to(pin).emit('circle-opened', {
-        circleIndex,
+      const result = room.claimKey(playerId, keyId);
+
+      // Broadcast claim
+      io.to(pin).emit('keywall:claimed', {
+        keyId,
         gender: result.gender,
         playerId,
-        openedCircles: room.openedCircles,
-        players: room.players,
-        counts: room.getCircleCounts()
+        auto: false,
+        ...room.getCurrentPhaseState()
       });
 
-      callback({ success: true, gender: result.gender });
+      // Advance turn
+      room.advanceTurn('claimed');
 
-      // Auto-advance to next player if current player has no more keys
-      const currentPlayer = room.players[room.currentPlayerIndex];
-      if (currentPlayer.keys === 0) {
-        setTimeout(() => {
-          const nextResult = room.nextPlayerTurn();
-
-          if (nextResult.gameFinished) {
-            const winner = room.calculateWinner();
-            io.to(pin).emit('game-finished', {
-              gameState: room.gameState,
-              winner,
-              players: room.players,
-              babyGender: room.config.babyGender
-            });
-          } else {
-            io.to(pin).emit('player-turn-changed', {
-              currentPlayerIndex: room.currentPlayerIndex,
-              players: room.players
-            });
-          }
-        }, 2000); // Wait 2 seconds for animation
+      // Check if wall ended
+      if (room.gameState === 'RESULTS_COMPARISON') {
+        stopKeyWallTimer(pin);
+        handleKeyWallEnd(pin, room);
+      } else {
+        // Emit new turn
+        io.to(pin).emit('keywall:turn', {
+          currentTurnPlayerId: room.turnQueue[room.currentTurnPlayerIndex],
+          remainingMs: room.currentTurnDeadlineMs - Date.now()
+        });
       }
+
+      callback({ success: true, gender: result.gender });
     } catch (error) {
+      console.error('Error claiming key:', error);
       callback({ success: false, error: error.message });
     }
   });
 
-  // Next player turn
-  socket.on('next-player-turn', ({ pin }, callback) => {
+  // =========================================================================
+  // RESULTS PHASE (Issue #4)
+  // =========================================================================
+
+  // Host can manually advance from comparison to winner (optional)
+  socket.on('results:show-winner', ({ pin }, callback) => {
     try {
       const room = rooms.get(pin);
       if (!room) {
         return callback({ success: false, error: 'Room not found' });
       }
 
-      const result = room.nextPlayerTurn();
-
-      if (result.gameFinished) {
-        const winner = room.calculateWinner();
-        io.to(pin).emit('game-finished', {
-          gameState: room.gameState,
-          winner,
-          players: room.players,
-          babyGender: room.config.babyGender
-        });
-      } else {
-        io.to(pin).emit('player-turn-changed', {
-          currentPlayerIndex: room.currentPlayerIndex,
-          players: room.players
-        });
+      if (socket.id !== room.adminSocketId) {
+        return callback({ success: false, error: 'Only admin can advance' });
       }
+
+      if (room.gameState !== 'RESULTS_COMPARISON') {
+        return callback({ success: false, error: 'Not in comparison phase' });
+      }
+
+      room.advanceToWinner();
+      const winners = room.calculateWinners();
+
+      io.to(pin).emit('results:winner', winners);
 
       callback({ success: true });
     } catch (error) {
@@ -421,7 +511,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Disconnect handler
+  // =========================================================================
+  // DISCONNECT HANDLER (Issue #2)
+  // =========================================================================
+
   socket.on('disconnect', () => {
     console.log(`Client disconnected: ${socket.id}`);
 
@@ -430,20 +523,19 @@ io.on('connection', (socket) => {
       if (room.adminSocketId === socket.id) {
         // Admin disconnected - notify players and close room
         io.to(pin).emit('admin-disconnected');
-        stopRoomTimer(pin);
+        stopQuizTimer(pin);
+        stopKeyWallTimer(pin);
         rooms.delete(pin);
         console.log(`Room ${pin} closed - admin disconnected`);
       } else {
-        // Check if player disconnected
-        const player = room.players.find(p => p.socketId === socket.id);
+        // Issue #2: Mark player as disconnected, DON'T remove them
+        const player = room.disconnectPlayer(socket.id);
         if (player) {
-          room.removePlayer(player.id);
-          io.to(pin).emit('player-left', {
+          io.to(pin).emit('player-disconnected', {
             playerId: player.id,
             playerName: player.name,
-            players: room.players
+            players: room.getPlayersState()
           });
-          console.log(`Player ${player.name} left room ${pin}`);
         }
       }
     }
@@ -455,4 +547,5 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🚀 Gender Reveal Game Server running on port ${PORT}`);
   console.log(`📱 Ready for multiplayer connections!`);
+  console.log(`🔒 Reconnection & anti-stall systems active`);
 });

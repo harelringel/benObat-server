@@ -219,6 +219,7 @@ io.on('connection', (socket) => {
       callback({
         success: true,
         pin: room.pin,
+        adminToken: room.adminToken,
         room: room.getState()
       });
     } catch (error) {
@@ -302,6 +303,35 @@ io.on('connection', (socket) => {
       });
     } catch (error) {
       console.error('Error rejoining room:', error);
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // Admin rejoin with adminToken
+  socket.on('admin:rejoin', ({ pin, adminToken }, callback) => {
+    try {
+      const room = rooms.get(pin);
+
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
+      }
+
+      if (room.adminToken !== adminToken) {
+        return callback({ success: false, error: 'Invalid admin token' });
+      }
+
+      // Update admin socket ID
+      room.adminSocketId = socket.id;
+      socket.join(pin);
+
+      console.log(`Admin rejoined room ${pin}`);
+
+      callback({
+        success: true,
+        room: room.getState()
+      });
+    } catch (error) {
+      console.error('Error admin rejoining room:', error);
       callback({ success: false, error: error.message });
     }
   });

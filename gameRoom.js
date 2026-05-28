@@ -3,6 +3,7 @@ const crypto = require('crypto');
 class GameRoom {
   constructor(config) {
     this.pin = this.generatePin();
+    this.adminToken = crypto.randomBytes(16).toString('hex');
     this.config = {
       ...config,
       reviewDurationSec: config.reviewDurationSec || 4,

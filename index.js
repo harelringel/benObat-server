@@ -129,6 +129,11 @@ function handleQuestionEnd(pin, room, reason, resolvedBy) {
     } else {
       // Next question
       const activePlayerId = room.quizTurnQueue[room.currentQuizTurnIndex];
+      const socketsInRoom = io.sockets.adapter.rooms.get(pin)?.size || 0;
+      const connectedPlayers = room.players.filter(p => p.connected && p.inGame).length;
+
+      console.log(`[room ${pin}] broadcast question:started Q${room.currentQuestionIndex + 1} to ${socketsInRoom} sockets (${connectedPlayers} players connected)`);
+
       io.to(pin).emit('question:started', {
         ...room.getCurrentPhaseState(),
         questionId: room.currentQuestionIndex,
@@ -317,7 +322,7 @@ io.on('connection', (socket) => {
 
       socket.join(pin);
 
-      console.log(`Player ${player.name} rejoined room ${pin}`);
+      console.log(`Player ${player.name} rejoined room ${pin} (state: ${room.gameState})`);
 
       // Notify all players
       io.to(pin).emit('player-reconnected', {
@@ -325,6 +330,24 @@ io.on('connection', (socket) => {
         playerName: player.name,
         players: room.getPlayersState()
       });
+
+      // Round 4 Issue #4: If in ASKING phase, send current question directly
+      if (room.gameState === 'ASKING') {
+        const activePlayerId = room.quizTurnQueue[room.currentQuizTurnIndex];
+        socket.emit('question:started', {
+          ...room.getCurrentPhaseState(),
+          questionId: room.currentQuestionIndex,
+          index: room.currentQuestionIndex,
+          total: room.config.questions.length,
+          type: 'multiple_choice',
+          prompt: room.getCurrentQuestion().question,
+          options: room.getCurrentQuestion().options,
+          activePlayerId: activePlayerId,
+          phase: room.quizPhase,
+          deadlineMs: room.currentQuestionDeadlineMs
+        });
+        console.log(`[room ${pin}] sent current question to rejoining player ${player.name}`);
+      }
 
       // Send current phase state to rejoining player
       callback({
@@ -446,6 +469,11 @@ io.on('connection', (socket) => {
 
       // Emit first question with full details (same as question:started)
       const activePlayerId = room.quizTurnQueue[room.currentQuizTurnIndex];
+      const socketsInRoom = io.sockets.adapter.rooms.get(pin)?.size || 0;
+      const connectedPlayers = room.players.filter(p => p.connected && p.inGame).length;
+
+      console.log(`[room ${pin}] broadcast question:started to ${socketsInRoom} sockets (${connectedPlayers} players connected)`);
+
       io.to(pin).emit('question:started', {
         ...room.getCurrentPhaseState(),
         questionId: room.currentQuestionIndex,

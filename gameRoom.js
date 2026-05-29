@@ -4,12 +4,32 @@ class GameRoom {
   constructor(config) {
     this.pin = this.generatePin();
     this.adminToken = crypto.randomBytes(16).toString('hex');
+
+    // Round 4 Issue #2: Honor questionCount setting
+    const questionCount = config.questionCount || config.questions?.length || 20;
+    const allQuestions = config.questions || [];
+
+    // Slice questions based on questionCount and randomize if requested
+    let selectedQuestions = allQuestions;
+    if (config.randomizeOrder && allQuestions.length > questionCount) {
+      // Shuffle and take first questionCount
+      const shuffled = [...allQuestions].sort(() => Math.random() - 0.5);
+      selectedQuestions = shuffled.slice(0, questionCount);
+    } else {
+      // Take first questionCount
+      selectedQuestions = allQuestions.slice(0, questionCount);
+    }
+
     this.config = {
       ...config,
+      questions: selectedQuestions, // Use sliced array
       reviewDurationSec: config.reviewDurationSec || 4,
       turnTimeLimitSec: config.turnTimeLimitSec || 15,
       comparisonDurationSec: config.comparisonDurationSec || 8
     };
+
+    console.log(`[room ${this.pin}] game config: questionCount=${questionCount} (of ${allQuestions.length} in pool), randomize=${!!config.randomizeOrder}, keyCount=${config.boardSize || 16}`);
+
     this.adminSocketId = null;
     this.players = [];
 

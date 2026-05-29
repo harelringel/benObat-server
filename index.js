@@ -170,6 +170,10 @@ function startKeyWallTimer(pin, room) {
     // Check timeout
     if (remainingMs <= 0) {
       // Auto-pick for this player
+      const currentPlayerId = room.turnQueue[room.currentTurnPlayerIndex];
+      const currentPlayer = room.players.find(p => p.id === currentPlayerId);
+      console.log(`[room ${pin}] keywall turn timeout → auto-picking for ${currentPlayer?.name || currentPlayerId}`);
+
       const key = room.autoPickKey();
 
       if (key) {
@@ -189,6 +193,12 @@ function startKeyWallTimer(pin, room) {
       if (room.gameState === 'KEY_WALL_DONE') {
         stopKeyWallTimer(pin);
         handleKeyWallEnd(pin, room);
+      } else {
+        // Emit new turn (CRITICAL: clients need this to update UI)
+        io.to(pin).emit('keywall:turn', {
+          currentTurnPlayerId: room.turnQueue[room.currentTurnPlayerIndex],
+          remainingMs: room.currentTurnDeadlineMs - Date.now()
+        });
       }
     }
   }, 1000);
